@@ -7,7 +7,11 @@ import requests
 import re
 import json
 import glob
-
+import threading
+import sys
+import traceback
+import time
+import csv
 
 BASE_URL = 'http://www.winemag.com/?s=&drink_type=wine&page={0}'
 session = requests.Session()
@@ -35,7 +39,7 @@ class Scraper():
         self.start_time = time.time()
         self.cross_process_review_count = 0
         self.estimated_total_reviews = (pages_to_scrape[1] - pages_to_scrape[0]) * 30
-
+        
         if num_jobs > 1:
             self.multiprocessing = True
             self.worker_pool = Pool(num_jobs)
@@ -54,39 +58,90 @@ class Scraper():
             for page in range(self.pages_to_scrape[0], self.pages_to_scrape[1]):
                 self.scrape_page(BASE_URL.format(page))
         print('Scrape finished...')
-        self.condense_data()
+        #self.condense_data()
 
     def scrape_page(self, page_url, isolated_review_count=0):
-        scrape_data = []
-        response = self.session.get(page_url, headers=HEADERS)
-        soup = BeautifulSoup(response.content, 'html.parser')
-        # Drop the first review-item; it's always empty
-        reviews = soup.find_all('li', {'class': 'review-item'})[1:]
-        for review in reviews:
-            self.cross_process_review_count += 1
-            isolated_review_count += 1
-            review_url = review.find('a', {'class': 'review-listing'})['href']
-            review_data = self.scrape_review(review_url)
-            scrape_data.append(review_data)
-            self.update_scrape_status()
-        self.save_data(scrape_data)
+        try:
+            scrape_data = []
+            ident = re.search('page=([0-9]+)$', page_url).group(1)
+            filename = '{}/{}_{}.json'.format(DATA_DIR, FILENAME, ident)
+            if os.path.isfile(filename):
+                print('Skipping page {}\n'.format(ident))
+                self.estimated_total_reviews -= 30
+                return;
+            
+            tries = 0;
+            while tries != -1:
+                try:
+                    response = self.session.get(page_url, headers=HEADERS)
+                    soup = BeautifulSoup(response.content, 'html.parser')
+                    # Drop the first review-item; it's always empty
+                    reviews = soup.find_all('li', {'class': 'review-item'})[1:]
+                    tries = -1
+                except Exception as eee:
+                    tries += 1
+                    if tries > 10:
+                        print('\n-----\nError parsing page: {}\n{}\n-----'.format(page_url, eee))
+                        time.sleep(15)
+                        raise
+            
+                            
+            for review in reviews:
+                tries = 0;
+                while tries != -1: 
+                    try:
+                        self.cross_process_review_count += 1
+                        isolated_review_count += 1
+                        review_url = review.find('a', {'class': 'review-listing'})['href']
+                        review_data = self.scrape_review(review_url)
+                        scrape_data.append(review_data)
+                        self.update_scrape_status()
+                        tries = -1
+                    except Exception as e:
+                        tries += 1
+                        print ('Retrying {}. Attempt # {}'.format(review_url, tries))
+                        
+                        time.sleep(10*tries)
+                        
+                        if tries > 20:
+                            print('\n-----\nError parsing review: {}\n{}\n-----'.format(review_url, e))
+                            raise
+            self.save_data(scrape_data, ident)
+        except Exception as e:
+            print('\n-----\nError parsing page: {}\n{}\n-----'.format(
+                page_url, e
+            ))
+            print(traceback.format_exc())
+            exit();
 
 
     def scrape_review(self, review_url):
         review_response = self.session.get(review_url, headers=HEADERS)
         review_soup = BeautifulSoup(review_response.content, 'html.parser')
-        try:
-            return self.parse_review(review_soup)
-        except ReviewFormatException as e:
-            print('\n-----\nError parsing: {}\n{}\n-----'.format(
-                review_url,
-                e.message
-            ))
+        
+        return self.parse_review(review_soup)
+
 
     def parse_review(self, review_soup):
         review_format = self.determine_review_format(review_soup)
         points = review_soup.find("span", {"id": "points"}).contents[0]
-        description = review_soup.find("p", {"class": "description"}).contents[0]
+        
+        des_cont = review_soup.find("p", {"class": "description"})
+        if len(des_cont.contents) == 0:
+            description = None
+        else:
+            description = des_cont.contents[0]
+        
+        fullname = review_soup.find("div", {"class": "article-title"}).contents[0]
+        
+        vintage_re = re.search('[0-9]{4}',fullname)
+        
+        
+        if vintage_re is None:
+            vintage = None
+        else :
+            vintage = vintage_re.group(0)
+            
 
         info_containers = review_soup.find(
             'ul', {'class': 'primary-info'}).find_all('li', {'class': 'row'})
@@ -164,6 +219,8 @@ class Scraper():
 
         review_data = {
             'points': points,
+            'fullname': fullname,
+            'vintage': vintage,
             'description': description,
             'price': price,
             'designation': designation,
@@ -220,8 +277,8 @@ class Scraper():
 
         return review_format
 
-    def save_data(self, data):
-        filename = '{}/{}_{}.json'.format(DATA_DIR, FILENAME, time.time())
+    def save_data(self, data, ident):
+        filename = '{}/{}_{}.json'.format(DATA_DIR, FILENAME, ident)
         try:
             os.makedirs(DATA_DIR)
         except OSError:
@@ -253,15 +310,22 @@ class Scraper():
             with open(file, 'rb') as fin:
                 condensed_data += json.load(fin)
         print(len(condensed_data))
-        filename = '{}.json'.format(FILENAME)
-        with open(filename, 'w') as fout:
-            json.dump(condensed_data, fout)
-
+        #filename = '{}.json'.format(FILENAME)
+        #with open(filename, 'w') as fout:
+        #    json.dump(condensed_data, fout)
+        
+        csvfilename = '{}.csv'.format(FILENAME)
+        with open(csvfilename, 'w') as fout:
+            csvwriter = csv.writer(fout, dialect='excel')
+            csvwriter.writerow(condensed_data[0])
+        
+        print('completed')        
+            
     def update_scrape_status(self):
         elapsed_time = round(time.time() - self.start_time, 2)
         time_remaining = round((self.estimated_total_reviews / self.cross_process_review_count) * elapsed_time, 2)
-        print('{0}/{1} reviews | {2} sec elapsed | {3} sec remaining\r'.format(
-            self.cross_process_review_count, self.estimated_total_reviews, elapsed_time, time_remaining), end='')
+        print('{4} {0}/{1} reviews | {2} sec elapsed | {3} sec remaining\r\n'.format(
+            self.cross_process_review_count, self.estimated_total_reviews, elapsed_time, time_remaining, threading.current_thread().name), end='')
 
 
 class ReviewFormatException(Exception):
@@ -273,8 +337,13 @@ class ReviewFormatException(Exception):
 
 if __name__ == '__main__':
     # Total review results on their site are conflicting, hardcode as the max tested value for now
-    pages_to_scrape = (3939, 7071)
-    winmag_scraper = Scraper(pages_to_scrape=pages_to_scrape, num_jobs=10, clear_old_data=False)
+    #pages_to_scrape = (1, 7487)
+    start = int(sys.argv[1])
+    stop = int(sys.argv[2])
+    workers = int(sys.argv[3])
+    pages_to_scrape = (start,stop)
+    winmag_scraper = Scraper(pages_to_scrape=pages_to_scrape, num_jobs=workers, clear_old_data=False)
+    #winmag_scraper.scrape_site();
 
     winmag_scraper.condense_data()
 
